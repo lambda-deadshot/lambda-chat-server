@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>P2P Group Chat</title>
+    <style>
+        #messages { 
+            height: 400px; 
+            overflow-y: auto; 
+            border: 1px solid #ccc; 
+            padding: 10px; 
+            margin-bottom: 10px; 
+        }
+        #message-input { 
+            width: 80%; 
+            padding: 5px; 
+        }
+        button { 
+            padding: 5px 15px; 
+        }
+        .message {
+            margin: 5px 0;
+        }
+        .username {
+            font-weight: bold;
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="messages"></div>
+    <input type="text" id="message-input" placeholder="Type your message...">
+    <button onclick="sendMessage()">Send</button>
+
+    <script>
+        // Store connections with their peer IDs
+        const peerConnections = new Map(); // peerId -> RTCPeerConnection
+        const dataChannels = new Map();    // peerId -> RTCDataChannel
+        let myPeerId = null;
+
+        const configuration = { 
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        };
+
+        // Connect to signaling server
+        const ws = new WebSocket('ws://localhost:8080');
+
+        ws.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+            console.log('Received message:', data);
+
+            // Set our peer ID when we get our first message
+            if (!myPeerId && data.senderId) {
+                myPeerId = data.senderId;
+            }
+
+            switch(data.type) {
+                case 'existing-peers':
+                    // Initialize connection to each existing peer
+                    for (const peerId of data.peerIds) {
+                        await createPeerConnection(peerId, true);
+                    }
+                    break;
+
+                case 'new-peer':
+                    // Wait for the new peer to initiate connection
+                    await createPeerConnection(data.peerId, false);
+                    break;
+
+                case 'offer':
+                    await handleOffer(data);
+                    break;
+
+                case 'answer':
+                    await handleAnswer(data);
+                    break;
+
+                case 'ice-candidate':
+                    await handleIceCandidate(data);
+                    break;
+
+                case 'peer-disconnected':
+                    handlePeerDisconnection(data.peerId);
+                    break;
+            }
+        };
+
+        async function createPeerConnection(peerId, initiator) {
+            const peerConnection = new RTCPeerConnection(configuration);
+            peerConnections.set(peerId, peerConnection);
+
+            // Set up ICE candidate handling
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        candidate: event.candidate,
+                        targetPeerId: peerId
+                    }));
+                }
+            };
+
+            // Handle data channel
+            if (initiator) {
+                const dataChannel = peerConnection.createDataChannel('chat');
+                setupDataChannel(dataChannel, peerId);
+            } else {
+                peerConnection.ondatachannel = (event) => {
+                    setupDataChannel(event.channel, peerId);
+                };
+            }
+
+            // If we're the initiator, create and send the offer
+            if (initiator) {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                ws.send(JSON.stringify({
+                    type: 'offer',
+                    offer: offer,
+                    targetPeerId: peerId
+                }));
+            }
+
+            return peerConnection;
+        }
+
+        async function handleOffer(data) {
+            const peerId = data.senderId;
+            let peerConnection = peerConnections.get(peerId);
+
+            if (!peerConnection) {
+                peerConnection = await createPeerConnection(peerId, false);
+            }
+
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+
+            ws.send(JSON.stringify({
+                type: 'answer',
+                answer: answer,
+                targetPeerId: peerId
+            }));
+        }
+
+        async function handleAnswer(data) {
+            const peerConnection = peerConnections.get(data.senderId);
+            if (peerConnection) {
+                try {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                } catch (e) {
+                    console.error('Error setting remote description:', e);
+                }
+            }
+        }
+
+        async function handleIceCandidate(data) {
+            const peerConnection = peerConnections.get(data.senderId);
+            if (peerConnection) {
+                try {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                } catch (e) {
+                    console.error('Error adding received ice candidate:', e);
+                }
+            }
+        }
+
+        function setupDataChannel(channel, peerId) {
+            dataChannels.set(peerId, channel);
+
+            channel.onopen = () => {
+                console.log(`Data channel to peer ${peerId} opened`);
+            };
+
+            channel.onclose = () => {
+                console.log(`Data channel to peer ${peerId} closed`);
+                dataChannels.delete(peerId);
+            };
+
+            channel.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                appendMessage(data.message, data.senderId);
+            };
+        }
+
+        function handlePeerDisconnection(peerId) {
+            const connection = peerConnections.get(peerId);
+            if (connection) {
+                connection.close();
+                peerConnections.delete(peerId);
+            }
+            dataChannels.delete(peerId);
+        }
+
+        function sendMessage() {
+            const input = document.getElementById('message-input');
+            const message = input.value.trim();
+            
+            if (message) {
+                // Send to all open data channels
+                const messageData = {
+                    message: message,
+                    senderId: myPeerId
+                };
+
+                dataChannels.forEach(channel => {
+                    if (channel.readyState === 'open') {
+                        channel.send(JSON.stringify(messageData));
+                    }
+                });
+                
+                // Display own message
+                appendMessage(message, 'self');
+                input.value = '';
+            }
+        }
+
+        function appendMessage(message, senderId) {
+            const messagesDiv = document.getElementById('messages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+
+            const usernameSpan = document.createElement('span');
+            usernameSpan.className = 'username';
+            
+            // Set the username based on whether it's our message or someone else's
+            if (senderId === 'self') {
+                usernameSpan.textContent = 'You:';
+            } else {
+                usernameSpan.textContent = `User ${senderId}:`;
+            }
+
+            const messageSpan = document.createElement('span');
+            messageSpan.textContent = ` ${message}`;
+
+            messageDiv.appendChild(usernameSpan);
+            messageDiv.appendChild(messageSpan);
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        // Handle Enter key in input
+        document.getElementById('message-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>
